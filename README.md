@@ -41,6 +41,8 @@ pip install -r requirements.txt    # Windows는 install-numba.bat
 
 - 처음 한 번은 컴파일하느라 1분쯤 걸립니다. 그 뒤로는 캐시를 씁니다.
 - 탐색 스레드 수는 코어 수에 맞춰 정해지고, 환경 변수 `OMOK_THREADS`로 바꿀 수 있습니다.
+- 같은 상대와 여러 판을 이어서 둘 때는 앞 판을 기억합니다. 이긴 수순은 다시 두고, 진 수순은 갈라진 자리에서 다른 수를 찾습니다.
+  기록은 `agent/omok_memory.json`에 남고 3시간이 지나면 잊습니다. 끄려면 환경 변수 `OMOK_MEMORY=off`.
 
 ## 내 봇 붙이기
 

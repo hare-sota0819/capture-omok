@@ -27,7 +27,9 @@ changes the (at most four) lines through its point. Taking a move back restores
 the saved integers without looking anything up.
 """
 
+import hashlib
 import importlib.util
+import json
 import os
 import random
 import sys
@@ -98,6 +100,27 @@ INSTANT_BELOW_S = 0.08
 FIRST_REPLY_KINDS = (((0, 1), (0, -1), (1, 0), (-1, 0)),
                      ((1, 1), (1, -1), (-1, 1), (-1, -1)))
 FIRST_REPLIES = FIRST_REPLY_KINDS[0] + FIRST_REPLY_KINDS[1]
+# The kind tried first when nothing is known about the opponent: in a quarter
+# of a million games of the engine against itself White won a third of the
+# games begun diagonally and a fifth of those begun in a straight line.
+FIRST_REPLY_FAVOURITE = 1
+
+# For testing: count the clock in searched nodes (the test harness does the bookkeeping).
+NODE_CLOCK = False
+
+# Memory of the games of a match (see _Memory below). The environment variable
+# OMOK_MEMORY=off turns it off, OMOK_MEMORY_FILE names another file.
+MEMORY = True
+MEMORY_FILE = "omok_memory.json"
+MEMORY_KEEP_S = 3 * 3600.0    # older games are forgotten: they belong to another occasion
+MEMORY_GAMES = 64             # and no more games than this are kept
+MEMORY_MIN_MOVES = 4          # a game not won counts as lost only if it went on this long
+                              # (a single position someone asked about is not a game)
+MEMORY_LATE = (True, False)   # (as Black, as White): leave a lost game late, see _Memory
+MEMORY_GOOD = -200            # a search value from which our position counted as sound
+MEMORY_TRIES = 2              # a move that led to this many more losses than wins is given up
+MEMORY_THINK_S = 15.0         # where a lost game is left: think up to this long ...
+MEMORY_THINK_SHARE = 0.3      # ... but no more than this share of the clock
 
 # For experiments and self-play: when FIXED_NODES is set, every move gets the
 # same amount of search (counted in nodes) instead of a share of the clock, so
@@ -1544,8 +1567,209 @@ def make_engine(threads=1):
 
 
 # How many games this program has started as White (it begins at a random
-# point, so that programs run one game at a time vary too).
+# point, so that programs run one game at a time vary too). Only used when
+# the games of the match are not remembered.
 _white_games = [random.randrange(len(FIRST_REPLY_KINDS))]
+
+
+# --------------------------------------------------------------------------
+# Memory of the games of a match.
+#
+# The games of a match are not independent of each other: most opponents
+# answer the same moves in the same way every time. So a game that was won is
+# worth playing again move for move for as long as the opponent repeats
+# itself. A game that was lost is worth leaving, and where depends on the
+# colour. Black, who has the first move, mostly loses by a slip from a good
+# position: such a game is played again up to the last move after which the
+# search still thought the position sound, and there another move is found,
+# with much more time than usual (all the time the moves before it did not
+# need). If that fails too, or the position was never thought sound, the game
+# is left at the first move that was a choice. White is worse from the first
+# answer on, and what looks sound to the search in the middle of the game
+# mostly is not: White's lost games are always left at the first move.
+#
+# An agent is only ever shown positions, so that is what is remembered: for
+# each game, the positions it was asked about, what it played there and what
+# the search thought of it, and whether it went on to win (it knows that when
+# its own move completes a five; any other end counts as not won). The games
+# are kept in a small file next to this one, because every game of a match
+# may well be run as a program of its own; only recent games count.
+
+
+def _position_key(board, color):
+    cells = bytearray(CELLS + 1)
+    index = 0
+    for row in board:
+        for value in row:
+            cells[index] = int(value) + 1
+            index += 1
+    cells[CELLS] = color
+    return hashlib.blake2b(bytes(cells), digest_size=9).hexdigest()
+
+
+class _Memory:
+    """The games of this match so far. (Any method may fail, for instance when
+    the file cannot be written; the agent then plays on without.)"""
+
+    def __init__(self):
+        named = os.environ.get("OMOK_MEMORY_FILE", "")
+        if named:
+            self.paths = [named]
+        else:
+            import tempfile
+            self.paths = [os.path.join(os.path.dirname(os.path.abspath(__file__)), MEMORY_FILE),
+                          os.path.join(tempfile.gettempdir(), "capture_" + MEMORY_FILE)]
+        # oldest first: {"id", "t", "c", "w", "p": [[key, move, search value or None], ...]}
+        self.games = []
+        self.mine = {}            # id -> the records made by this program
+
+    def _stored(self):
+        """The games in the files, by id. (A game may be in both files, if one
+        of them could not be written for a while: the fuller record counts.)"""
+        found = {}
+        for path in self.paths:
+            try:
+                with open(path, encoding="utf-8") as handle:
+                    games = json.load(handle)["games"]
+                for game in games:
+                    if (isinstance(game["id"], str) and game["c"] in (0, 1)
+                            and isinstance(game["p"], list)):
+                        float(game["t"])
+                        known = found.get(game["id"])
+                        if known is None or (game["w"] is True, len(game["p"])) > (
+                                known["w"] is True, len(known["p"])):
+                            found[game["id"]] = game
+            except Exception:
+                continue
+        return found
+
+    def refresh(self):
+        """Read what other programs have written since; forget what is old."""
+        now = _time.time()
+        games = [game for key, game in self._stored().items() if key not in self.mine]
+        games.extend(self.mine.values())
+        games = [game for game in games if 0 <= now - float(game["t"]) <= MEMORY_KEEP_S]
+        games.sort(key=lambda game: float(game["t"]))
+        self.games = games[-MEMORY_GAMES:]
+
+    def save(self):
+        self.refresh()
+        text = json.dumps({"version": 1, "games": self.games}, separators=(",", ":"))
+        for path in self.paths:
+            temporary = "%s.%d.tmp" % (path, os.getpid())
+            try:
+                with open(temporary, "w", encoding="utf-8") as handle:
+                    handle.write(text)
+                for attempt in range(3):         # (another program may be reading it just now)
+                    try:
+                        os.replace(temporary, path)
+                        return
+                    except OSError:
+                        _time.sleep(0.004)
+            except Exception:
+                pass
+            try:
+                os.remove(temporary)
+            except Exception:
+                pass
+
+    def start_game(self, color):
+        record = {"id": os.urandom(8).hex(), "t": _time.time(), "c": color, "w": None, "p": []}
+        self.mine[record["id"]] = record
+        self.save()
+        return record
+
+    @staticmethod
+    def _blamed(game, shared=()):
+        """Which of its moves (an index into "p") a lost game is blamed on: the
+        last one after which the search still thought the position sound, or
+        the first one if it never did. For a colour not in MEMORY_LATE it is
+        the first move that no won game made in the same position (`shared`
+        holds those (position, move) pairs): up to there the game followed
+        one that was won, and the move after the opponent left that game is
+        the first one of its own."""
+        blamed = 0
+        if not MEMORY_LATE[game["c"]]:
+            for index, entry in enumerate(game["p"]):
+                if (entry[0], int(entry[1])) not in shared:
+                    return index
+            return max(len(game["p"]) - 1, 0)
+        for index, entry in enumerate(game["p"]):
+            value = entry[2] if len(entry) > 2 else None
+            if value is not None and value >= MEMORY_GOOD:
+                blamed = index
+        return blamed
+
+    def advice(self, record, key):
+        """What the earlier games with this colour say about this position:
+        (the move to play again or None, the search's value of that move in
+        the game it comes from, the moves not to play again, how often each
+        move was played here, whether a lost game is being left at this very
+        position)."""
+        won, lost, blamed, played, latest, values = {}, {}, {}, {}, {}, {}
+        late = MEMORY_LATE[record["c"]]
+        shared = set()
+        if not late:
+            for game in self.games:
+                if game is not record and game["c"] == record["c"] and game["w"] is True:
+                    shared.update((entry[0], int(entry[1])) for entry in game["p"])
+        for game in self.games:
+            if game is record or game["c"] != record["c"]:
+                continue
+            if game["w"] is not True and len(game["p"]) < MEMORY_MIN_MOVES:
+                continue
+            for index, entry in enumerate(game["p"]):
+                if entry[0] == key:
+                    if game["w"] is not True and not late and index > self._blamed(game, shared):
+                        break                # past its mistake: nothing there to go by
+                    move = int(entry[1])
+                    played[move] = played.get(move, 0) + 1
+                    latest[move] = float(game["t"])
+                    values[move] = entry[2] if len(entry) > 2 else None
+                    if game["w"] is True:
+                        won[move] = won.get(move, 0) + 1
+                    else:
+                        lost[move] = lost.get(move, 0) + 1
+                        if index == self._blamed(game, shared):
+                            blamed[move] = blamed.get(move, 0) + 1
+                    break
+        again, avoid, leaving = None, [], False
+        for move in played:
+            wins, losses = won.get(move, 0), lost.get(move, 0)
+            if wins > 0 and wins >= losses:
+                order = (2, wins - losses, latest[move])        # it won: once more
+            elif blamed.get(move, 0) > 0 or losses - wins >= MEMORY_TRIES:
+                avoid.append(move)
+                leaving = leaving or blamed.get(move, 0) > 0
+                continue
+            else:
+                order = (1, 0, latest[move])                    # a lost game, before it went wrong
+            if again is None or order > again[0]:
+                again = (order, move)
+        if again is None:
+            return None, None, avoid, played, leaving
+        return again[1], values.get(again[1]), avoid, played, False
+
+    def note(self, record, key, move, won, value=None):
+        record["p"].append([key, int(move), None if value is None else int(value)])
+        if won:
+            record["w"] = True
+        self.save()
+
+
+_memory = [None, False]       # the memory of this program; whether making it has been tried
+
+
+def _the_memory():
+    if not MEMORY or os.environ.get("OMOK_MEMORY", "").strip().lower() in ("off", "0", "no"):
+        return None
+    if not _memory[1]:
+        _memory[1] = True
+        try:
+            _memory[0] = _Memory()
+        except Exception:
+            _memory[0] = None
+    return _memory[0]
 
 
 class SmartPlayer(Player):
@@ -1553,6 +1777,8 @@ class SmartPlayer(Player):
         super().__init__(color)
         self._engine = _Engine()
         self._fast = None
+        self._record = None                  # this game in the memory of the match
+        self._value = None                   # what the search thought of the move just chosen
         if _fast is not None:
             try:
                 self._fast = _fast.FastEngine(PATTERN_SCORES, PATTERN_TERMS,
@@ -1564,10 +1790,91 @@ class SmartPlayer(Player):
 
     def take_turn(self, board, time):
         start = _time.perf_counter()
+        memory = _the_memory()
+        key, avoid, played, wins, move, leaving = None, (), None, False, None, False
+        self._value = None
+        if memory is not None:
+            try:
+                stones = sum(1 for row in board for value in row if value != -1)
+                if self._record is None or stones <= 1:
+                    self._record = memory.start_game(self.color)
+                key = _position_key(board, self.color)
+                again, value, avoid, played, leaving = memory.advice(self._record, key)
+                wins = self._wins_at_once(board)
+                if (again is not None and not wins and 0 <= again < CELLS
+                        and board[again // SIZE][again % SIZE] == -1):
+                    move = (again // SIZE, again % SIZE)
+                    self._value = value
+            except Exception:
+                memory, avoid, played, move, leaving = None, (), None, None, False
+        if move is None:
+            move = self._think(board, time, start, avoid, played, leaving)
+        if memory is not None:
+            try:
+                cell = int(move[0]) * SIZE + int(move[1])
+                if cell in avoid:
+                    self._value = None       # there was nothing else: not a move to come back to
+                memory.note(self._record, key, cell, wins, self._value)
+            except Exception:
+                pass
+        return move
+
+    def _wins_at_once(self, board):
+        """Can a five be completed with this move? (Only the compiled engine is asked.)"""
+        fast = self._fast
+        if fast is None:
+            return False
+        try:
+            fast.load(board)
+            return fast.total(self.color + 1, _fast.G_WIN) > 0
+        except Exception:
+            return False
+
+    def _choose_fast(self, colour, budget, avoid):
+        """The compiled engine's move; not one of the moves in `avoid` unless
+        there is nothing else to play. (The engine draws its moves from a few
+        lists, whatever the kind of position: those moves are taken out of
+        each list that would not be left empty, and a forced win of ours that
+        begins with one of them is not believed a second time.)"""
+        fast = self._fast
+        banned = set(_fast.to_point(move // SIZE, move % SIZE) for move in avoid)
+        if not banned:
+            return fast.choose(colour, budget)
+        names = ("candidates", "forced_replies", "defences", "ordered", "defusing_moves",
+                 "try_vcf", "try_vct")
+        usual = dict((name, getattr(fast, name)) for name in names)
+
+        def allowed(moves):
+            kept = [move for move in moves if move not in banned]
+            return kept or moves
+
+        def without_banned_win(search):
+            def searched(side, *rest):
+                move = search(side, *rest)
+                return -1 if side == colour and move in banned else move
+            return searched
+
+        fast.candidates = lambda side, limit: allowed(
+            usual["candidates"](side, limit + len(banned)))[:limit]
+        fast.forced_replies = lambda side: allowed(usual["forced_replies"](side))
+        fast.defences = lambda side: allowed(usual["defences"](side))
+        fast.ordered = lambda points, side: allowed(usual["ordered"](points, side))
+        fast.defusing_moves = lambda *arguments: allowed(usual["defusing_moves"](*arguments))
+        fast.try_vcf = without_banned_win(usual["try_vcf"])
+        fast.try_vct = without_banned_win(usual["try_vct"])
+        try:
+            return fast.choose(colour, budget)
+        finally:
+            for name in names:
+                delattr(fast, name)
+
+    def _think(self, board, time, start, avoid=(), played=None, long=False):
+        """The move to play, found by thinking. `long`: this is where a game
+        lost earlier is being left, and most of the clock is still there."""
         colour = self.color + 1
         move = -1
         if self.color == 1:
-            reply = self._first_reply(board)
+            reply = self._first_reply(board, avoid, played)
             if reply is not None:
                 return reply
         if self._fast is not None:
@@ -1576,11 +1883,18 @@ class SmartPlayer(Player):
                 fast.load(board)
                 if FIXED_NODES:
                     fast.use_node_clock()
-                    move = fast.choose(colour, FIXED_NODES / float(fast.NODE_RATE))
+                    move = self._choose_fast(colour, FIXED_NODES / float(fast.NODE_RATE), avoid)
+                elif NODE_CLOCK:
+                    fast.use_node_clock()
+                    stones = fast.total(1, 5) + fast.total(2, 5)
+                    budget = self._budget(time, stones, long)
+                    move = self._choose_fast(colour, max(budget, 0.0), avoid)
                 else:
                     stones = fast.total(1, 5) + fast.total(2, 5)
-                    budget = self._budget(time, stones) - (_time.perf_counter() - start)
-                    move = fast.choose(colour, max(budget, 0.0))
+                    budget = self._budget(time, stones, long) - (_time.perf_counter() - start)
+                    move = self._choose_fast(colour, max(budget, 0.0), avoid)
+                if fast.info is not None:
+                    self._value = int(fast.info[1])
             except Exception:
                 self._fast = None            # the plain engine takes over for good
                 move = -1
@@ -1603,11 +1917,13 @@ class SmartPlayer(Player):
         return self._any_legal_move(board)
 
     @staticmethod
-    def _first_reply(board):
+    def _first_reply(board, avoid=(), played=None):
         """White's answer to the first stone, or None if this is not that moment.
         Successive games take the kinds of answer in turn: one win as White
         usually decides a match, and what fails against an opponent once is
-        likely to fail against it again."""
+        likely to fail against it again. `played` says how often each point
+        was answered with in the remembered games of the match (None if they
+        are not remembered) and `avoid` which of those answers lost."""
         stone = None
         for r in range(SIZE):
             row = board[r]
@@ -1619,20 +1935,32 @@ class SmartPlayer(Player):
         if stone is None:
             return None
         r, c = stone
-        turn = _white_games[0]
-        _white_games[0] += 1
-        for step in range(len(FIRST_REPLY_KINDS)):
-            kind = FIRST_REPLY_KINDS[(turn + step) % len(FIRST_REPLY_KINDS)]
-            options = [(r + dr, c + dc) for dr, dc in kind
-                       if 2 <= r + dr < SIZE - 2 and 2 <= c + dc < SIZE - 2]
-            if options:
-                return random.choice(options)
+        kinds = [[(r + dr, c + dc) for dr, dc in kind
+                  if 2 <= r + dr < SIZE - 2 and 2 <= c + dc < SIZE - 2]
+                 for kind in FIRST_REPLY_KINDS]
+        if played is None:
+            turn = _white_games[0]
+            _white_games[0] += 1
+            order = [(turn + step) % len(kinds) for step in range(len(kinds))]
+        else:
+            # The kind tried least so far, the favourite first among equals.
+            tried = [sum(played.get(row * SIZE + col, 0) for row, col in kind) for kind in kinds]
+            order = sorted(range(len(kinds)),
+                           key=lambda index: (tried[index], index != FIRST_REPLY_FAVOURITE))
+        banned = set(avoid)
+        for fresh in (True, False):          # an answer that has not lost, if there is one left
+            for index in order:
+                options = [(row, col) for row, col in kinds[index]
+                           if not fresh or row * SIZE + col not in banned]
+                if options:
+                    return random.choice(options)
         # The stone is in a corner: step towards the middle.
         return (r + (1 if r < SIZE // 2 else -1), c + (1 if c < SIZE // 2 else -1))
 
     @staticmethod
-    def _budget(time_ms, stones):
-        """Seconds to spend on this move, given the time left for the whole game."""
+    def _budget(time_ms, stones, long=False):
+        """Seconds to spend on this move, given the time left for the whole game.
+        (`long`: see _think.)"""
         if time_ms is None or time_ms < 0:
             return NO_LIMIT_MOVE_S
         usable = time_ms / 1000.0 - RESERVE_S
@@ -1640,6 +1968,8 @@ class SmartPlayer(Player):
         budget = min(MOVE_CAP_S, usable / moves_left)
         if stones < 4:
             budget *= 0.5                    # the first moves need little thought
+        if long:
+            budget = max(budget, min(MEMORY_THINK_S, usable * MEMORY_THINK_SHARE))
         return max(budget, 0.0)
 
     @staticmethod
