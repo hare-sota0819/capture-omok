@@ -1,61 +1,83 @@
 # Capture Omok
 
-따내기가 있는 오목입니다. 창에서 직접 두거나, 봇끼리 붙여 놓고 구경할 수 있습니다.
+따내기 있는 오목. 창에서 직접 두거나 봇끼리 붙여 놓고 구경할 수 있음.
 
 ## 규칙
 
-- 19x19, 흑이 먼저 둡니다.
-- 정확히 다섯 개가 이어져야 이깁니다. 여섯 개 이상은 오목이 아닙니다.
-- 내 돌 - 상대 돌 두 개 - 내 돌 모양이 되면 가운데 두 개를 따냅니다(8방향).
-- 따내기 때문에 상대의 여섯 줄이 다섯 줄이 되면 상대가 이깁니다. 한 수로 양쪽에 오목이 생기면 무승부입니다.
-- 시간은 한 판 전체에 대해 각자 주어지고, 다 쓰면 집니다.
+- 19x19, 흑 선
+- 딱 5개만 승리. 6목 이상은 안 쳐줌
+- 내 돌 / 상대 돌 2개 / 내 돌 모양이 되면 가운데 2개를 따냄. 8방향 다 됨
+- 따내서 상대 6목이 5목이 되면 상대 승. 한 수에 양쪽 다 5목이 생기면 무승부
+- 시간은 한 판 전체 기준이고, 다 쓰면 짐
 
 ## 실행
 
-Python 3.8 이상이면 됩니다. 창은 tkinter로 그리기 때문에 따로 설치할 것은 없습니다.
-Windows에서는 `play.bat`을 더블클릭하면 메뉴가 열립니다.
+Python 3.8 이상이면 됨. 창은 tkinter라서 따로 깔 건 없음.
+윈도우는 `play.bat` 더블클릭하면 메뉴 뜸.
 
 ```
-python game/omok.py                # 메뉴
-python game/omok.py 0 5 1          # 사람(흑) 대 Smart(백), 각자 1분
-python game/omok.py 5 2 1          # Smart 대 AlphaBeta 구경
+python game/omok.py              # 메뉴
+python game/omok.py 0 5 1        # 나(흑) vs Smart(백), 1분씩
+python game/omok.py 5 2 1        # Smart vs AlphaBeta 구경
 ```
 
-| 코드 | 상대 |
+| 번호 | 플레이어 |
 |---|---|
 | 0 | 사람 |
-| 1 | Random: 돌 근처 아무 데나 |
-| 2 | AlphaBeta: 알파베타 탐색 |
-| 3 | Threat: 위협 수순 위주 |
-| 4 | MCTS: 몬테카를로 트리 탐색 |
-| 5 | Smart: 제일 센 것 (`agent/`) |
+| 1 | Random |
+| 2 | AlphaBeta |
+| 3 | Threat |
+| 4 | MCTS |
+| 5 | Smart (제일 셈) |
 
-## Smart
+## Smart 봇
 
-`agent/smartplayer.py`와 `agent/fastcore.py` 두 파일입니다. numba가 있으면 컴파일된 엔진으로 돌고,
-없으면 같은 방식의 순수 Python 엔진으로 돕니다(훨씬 느려서 그만큼 약합니다).
-
-```
-pip install -r requirements.txt    # Windows는 install-numba.bat
-```
-
-- 처음 한 번은 컴파일하느라 1분쯤 걸립니다. 그 뒤로는 캐시를 씁니다.
-- 탐색 스레드 수는 코어 수에 맞춰 정해지고, 환경 변수 `OMOK_THREADS`로 바꿀 수 있습니다.
-- 같은 상대와 여러 판을 이어서 둘 때는 앞 판을 기억합니다. 이긴 수순은 다시 두고, 진 수순은 갈라진 자리에서 다른 수를 찾습니다.
-  기록은 `agent/omok_memory.json`에 남고 3시간이 지나면 잊습니다. 끄려면 환경 변수 `OMOK_MEMORY=off`.
-
-## 내 봇 붙이기
-
-`player.py`의 `Player`를 상속해서 `take_turn(board, time)`이 `(행, 열)`을 돌려주면 됩니다.
-`board`는 19x19 리스트(-1 빈칸, 0 흑, 1 백), `time`은 남은 시간(ms)입니다.
+`agent/smartplayer.py`, `agent/fastcore.py` 두 파일. numba가 깔려 있어야 제대로 돌아감.
+없어도 돌긴 하는데 훨씬 느려서 많이 약해짐.
 
 ```
-python game/omok.py path/to/mybot.py:MyBot 5 1
-python tools/arena.py path/to/mybot.py:MyBot smart --games 8 --minutes 1
+pip install -r requirements.txt     # 윈도우는 install-numba.bat 더블클릭
 ```
 
-`tools/arena.py`는 창 없이 여러 판을 돌리고 승패, 시간패, 반칙 수를 알려 줍니다.
-흑백은 판마다 바뀝니다. 흑이 많이 유리한 게임이라 한 판만 보고 판단하면 안 됩니다.
+- 처음 켤 때 컴파일하느라 1분 정도 걸림. 그다음부터는 바로 뜸
+- 스레드 수는 코어 수 보고 알아서 정함. 바꾸려면 `OMOK_THREADS`
+- 같은 상대랑 연달아 두면 앞 판을 기억함. 이긴 판은 그대로 다시 두고, 진 판은 갈라진 자리에서 다른 수를 찾음.
+  기록은 `agent/omok_memory.json`에 남고 3시간 지나면 잊음. 끄려면 `OMOK_MEMORY=off`
+
+## 자기 봇 붙여 보기
+
+`game/player.py`의 `Player`를 상속해서 `take_turn(board, time)`에서 `(행, 열)`을 리턴하면 됨.
+`board`는 19x19 리스트(-1 빈칸, 0 흑, 1 백), `time`은 남은 시간(ms).
+
+창에서 한 판:
+
+```
+python game/omok.py 경로/mybot.py:MyBot 5 1
+```
+
+창 없이 8판(흑백 번갈아 가면서):
+
+```
+python tools/arena.py 경로/mybot.py:MyBot smart --games 8 --minutes 1
+```
+
+흑이 엄청 유리한 게임이라 한두 판으로는 아무것도 모름. 최소 8판은 돌려 봐야 함.
+
+arena는 기본으로 Smart의 기억을 끄고 돌림. 실제 대결처럼 기억 켜고 하려면 `agent/omok_memory.json`을 지우고:
+
+```
+set OMOK_MEMORY=on
+python tools/arena.py 경로/mybot.py:MyBot smart --games 8 --minutes 1
+```
+
+맥/리눅스는 `OMOK_MEMORY=on python tools/arena.py ...`
+
+## 대결 전에 체크
+
+- numba 깔기 (`install-numba.bat`)
+- 컴파일 때문에 그 컴퓨터에서 미리 한 판 돌려 두기
+- 첫 판 전에 `agent/omok_memory.json` 지우기. 미리 돌린 판 기록이 남아 있음
+- 8판은 같은 컴퓨터에서 이어서 두기. 경기 중에는 기록 파일 건드리지 않기
 
 ## 테스트
 
